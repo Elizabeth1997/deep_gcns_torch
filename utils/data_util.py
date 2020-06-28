@@ -1,11 +1,14 @@
 import numpy as np
 import h5py
+from copy import copy
+from typing import Optional
 import os
 import os.path as osp
 import shutil
 from glob import glob
 import torch
 from torch_scatter import scatter
+import torch_geometric as tg
 from torch_geometric.data import InMemoryDataset, Data, extract_zip
 from tqdm import tqdm
 
@@ -27,31 +30,38 @@ def add_zeros(data):
     return data
 
 
-def extract_node_feature_add(data):
-    data.x = scatter(data.edge_attr,
-                     data.edge_index[0],
-                     dim=0,
-                     dim_size=data.num_nodes,
-                     reduce='add')
+def extract_node_feature(reduce, data):
+    if reduce in ['mean', 'max', 'add']:
+        data.x = scatter(data.edge_attr,
+                         data.edge_index[0],
+                         dim=0,
+                         dim_size=data.num_nodes,
+                         reduce=reduce)
+    else:
+        raise Exception('Unknown Aggregation Type')
     return data
 
 
-def extract_node_feature_mean(data):
-    data.x = scatter(data.edge_attr,
-                     data.edge_index[0],
-                     dim=0,
-                     dim_size=data.num_nodes,
-                     reduce='mean')
-    return data
+# random partition graph
+def random_partition_graph(num_nodes, cluster_number=10):
+    parts = np.random.randint(cluster_number, size=num_nodes)
+    return parts
 
 
-def extract_node_feature_max(data):
-    data.x = scatter(data.edge_attr,
-                     data.edge_index[0],
-                     dim=0,
-                     dim_size=data.num_nodes,
-                     reduce='max')
-    return data
+def generate_sub_graphs(adj, parts, cluster_number=10, batch_size=1):
+    # convert sparse tensor to scipy csr
+    adj = adj.to_scipy(layout='csr')
+
+    num_batches = cluster_number // batch_size
+
+    sg_nodes = [[] for _ in range(num_batches)]
+    sg_edges = [[] for _ in range(num_batches)]
+
+    for cluster in range(num_batches):
+        sg_nodes[cluster] = np.where(parts == cluster)[0]
+        sg_edges[cluster] = tg.utils.from_scipy_sparse_matrix(adj[sg_nodes[cluster], :][:, sg_nodes[cluster]])[0]
+
+    return sg_nodes, sg_edges
 
 
 def random_rotate(points):
@@ -74,19 +84,6 @@ def random_points_augmentation(points, rotate=False, translate=False, **kwargs):
         points = random_translate(points, **kwargs)
 
     return points
-
-
-def scale_translate_pointcloud(pointcloud, shift=[-0.2, 0.2], scale=[2. / 3., 3. /2.]):
-    """
-    for scaling and shifting the point cloud
-    :param pointcloud:
-    :return:
-    """
-    B, C, N = pointcloud.shape[0:3]
-    scale = scale[0] + torch.rand([B, C, 1, 1])*(scale[1]-scale[0])
-    shift = shift[0] + torch.rand([B, C, 1, 1]) * (shift[1]-shift[0])
-    translated_pointcloud = torch.mul(pointcloud, scale) + shift
-    return translated_pointcloud
 
 
 class PartNet(InMemoryDataset):
@@ -318,7 +315,6 @@ def get_atom_feature_dims():
         allowable_features['possible_is_in_ring_list']
         ]))
 
-
 def bond_to_feature_vector(bond):
     """
     Converts rdkit bond object to feature list of indices
@@ -339,7 +335,6 @@ def get_bond_feature_dims():
         allowable_features['possible_bond_stereo_list'],
         allowable_features['possible_is_conjugated_list']
         ]))
-
 
 def atom_feature_vector_to_dict(atom_feature):
     [atomic_num_idx,
@@ -379,3 +374,225 @@ def bond_feature_vector_to_dict(bond_feature):
     }
 
     return feature_dict
+
+
+# code from https://github.com/snap-stanford/ogb/blob/56115acd1f5ff35d0518f9192fe1fad8a5e94653/examples/graphproppred/code/utils.py#L6
+class ASTNodeEncoder(torch.nn.Module):
+    '''
+        Input:
+            x: default node feature. the first and second column represents node type and node attributes.
+            depth: The depth of the node in the AST.
+        Output:
+            emb_dim-dimensional vector
+    '''
+
+    def __init__(self, emb_dim, num_nodetypes, num_nodeattributes, max_depth):
+        super(ASTNodeEncoder, self).__init__()
+
+        self.max_depth = max_depth
+
+        self.type_encoder = torch.nn.Embedding(num_nodetypes, emb_dim)
+        self.attribute_encoder = torch.nn.Embedding(num_nodeattributes, emb_dim)
+        self.depth_encoder = torch.nn.Embedding(self.max_depth + 1, emb_dim)
+
+    def forward(self, x, depth):
+        depth[depth > self.max_depth] = self.max_depth
+        return self.type_encoder(x[:, 0]) + self.attribute_encoder(x[:, 1]) + self.depth_encoder(depth)
+
+
+def get_vocab_mapping(seq_list, num_vocab):
+    '''
+        Input:
+            seq_list: a list of sequences
+            num_vocab: vocabulary size
+        Output:
+            vocab2idx:
+                A dictionary that maps vocabulary into integer index.
+                Additioanlly, we also index '__UNK__' and '__EOS__'
+                '__UNK__' : out-of-vocabulary term
+                '__EOS__' : end-of-sentence
+            idx2vocab:
+                A list that maps idx to actual vocabulary.
+    '''
+
+    vocab_cnt = {}
+    vocab_list = []
+    for seq in seq_list:
+        for w in seq:
+            if w in vocab_cnt:
+                vocab_cnt[w] += 1
+            else:
+                vocab_cnt[w] = 1
+                vocab_list.append(w)
+
+    cnt_list = np.array([vocab_cnt[w] for w in vocab_list])
+    topvocab = np.argsort(-cnt_list, kind='stable')[:num_vocab]
+
+    print('Coverage of top {} vocabulary:'.format(num_vocab))
+    print(float(np.sum(cnt_list[topvocab])) / np.sum(cnt_list))
+
+    vocab2idx = {vocab_list[vocab_idx]: idx for idx, vocab_idx in enumerate(topvocab)}
+    idx2vocab = [vocab_list[vocab_idx] for vocab_idx in topvocab]
+
+    vocab2idx['__UNK__'] = num_vocab
+    idx2vocab.append('__UNK__')
+
+    vocab2idx['__EOS__'] = num_vocab + 1
+    idx2vocab.append('__EOS__')
+
+    # test the correspondence between vocab2idx and idx2vocab
+    for idx, vocab in enumerate(idx2vocab):
+        assert (idx == vocab2idx[vocab])
+
+    assert (vocab2idx['__EOS__'] == len(idx2vocab) - 1)
+
+    return vocab2idx, idx2vocab
+
+
+def augment_edge(data):
+    '''
+        Input:
+            data: PyG data object
+        Output:
+            data (edges are augmented in the following ways):
+                data.edge_index: Added next-token edge. The inverse edges were also added.
+                data.edge_attr (torch.Long):
+                    data.edge_attr[:,0]: whether it is AST edge (0) for next-token edge (1)
+                    data.edge_attr[:,1]: whether it is original direction (0) or inverse direction (1)
+    '''
+
+    ##### AST edge
+    edge_index_ast = data.edge_index
+    edge_attr_ast = torch.zeros((edge_index_ast.size(1), 2))
+
+    ##### Inverse AST edge
+    edge_index_ast_inverse = torch.stack([edge_index_ast[1], edge_index_ast[0]], dim=0)
+    edge_attr_ast_inverse = torch.cat(
+        [torch.zeros(edge_index_ast_inverse.size(1), 1), torch.ones(edge_index_ast_inverse.size(1), 1)], dim=1)
+
+    attributed_node_idx_in_dfs_order = torch.where(data.node_is_attributed.view(-1, ) == 1)[0]
+
+    edge_index_nextoken = torch.stack([attributed_node_idx_in_dfs_order[:-1], attributed_node_idx_in_dfs_order[1:]],
+                                      dim=0)
+    edge_attr_nextoken = torch.cat(
+        [torch.ones(edge_index_nextoken.size(1), 1), torch.zeros(edge_index_nextoken.size(1), 1)], dim=1)
+
+    ##### Inverse next-token edge
+    edge_index_nextoken_inverse = torch.stack([edge_index_nextoken[1], edge_index_nextoken[0]], dim=0)
+    edge_attr_nextoken_inverse = torch.ones((edge_index_nextoken.size(1), 2))
+
+    data.edge_index = torch.cat(
+        [edge_index_ast, edge_index_ast_inverse, edge_index_nextoken, edge_index_nextoken_inverse], dim=1)
+    data.edge_attr = torch.cat([edge_attr_ast, edge_attr_ast_inverse, edge_attr_nextoken, edge_attr_nextoken_inverse],
+                               dim=0)
+
+    return data
+
+
+def encode_y_to_arr(data, vocab2idx, max_seq_len):
+    '''
+    Input:
+        data: PyG graph object
+        output: add y_arr to data
+    '''
+
+    # PyG >= 1.5.0
+    seq = data.y
+
+    # PyG = 1.4.3
+    # seq = data.y[0]
+
+    data.y_arr = encode_seq_to_arr(seq, vocab2idx, max_seq_len)
+
+    return data
+
+
+def encode_seq_to_arr(seq, vocab2idx, max_seq_len):
+    '''
+    Input:
+        seq: A list of words
+        output: add y_arr (torch.Tensor)
+    '''
+
+    augmented_seq = seq[:max_seq_len] + ['__EOS__'] * max(0, max_seq_len - len(seq))
+    return torch.tensor([[vocab2idx[w] if w in vocab2idx else vocab2idx['__UNK__'] for w in augmented_seq]],
+                        dtype=torch.long)
+
+
+def decode_arr_to_seq(arr, idx2vocab):
+    '''
+        Input: torch 1d array: y_arr
+        Output: a sequence of words.
+    '''
+
+    eos_idx_list = (arr == len(idx2vocab) - 1).nonzero()  # find the position of __EOS__ (the last vocab in idx2vocab)
+    if len(eos_idx_list) > 0:
+        clippted_arr = arr[: torch.min(eos_idx_list)]  # find the smallest __EOS__
+    else:
+        clippted_arr = arr
+
+    return list(map(lambda x: idx2vocab[x], clippted_arr.cpu()))
+
+
+### tg for heterogenous graph process
+# https://github.com/rusty1s/pytorch_geometric/blob/master/torch_geometric/utils/num_nodes.py
+def maybe_num_nodes(index: torch.Tensor,
+                    num_nodes: Optional[int] = None) -> int:
+    return int(index.max()) + 1 if num_nodes is None else num_nodes
+
+
+# https://github.com/rusty1s/pytorch_geometric/blob/master/torch_geometric/utils/hetero.py
+def maybe_num_nodes_dict(edge_index_dict, num_nodes_dict=None):
+    num_nodes_dict = {} if num_nodes_dict is None else copy(num_nodes_dict)
+
+    found_types = list(num_nodes_dict.keys())
+
+    for keys, edge_index in edge_index_dict.items():
+
+        key = keys[0]
+        if key not in found_types:
+            N = int(edge_index[0].max() + 1)
+            num_nodes_dict[key] = max(N, num_nodes_dict.get(key, N))
+
+        key = keys[-1]
+        if key not in found_types:
+            N = int(edge_index[1].max() + 1)
+            num_nodes_dict[key] = max(N, num_nodes_dict.get(key, N))
+
+    return num_nodes_dict
+
+
+def group_hetero_graph(edge_index_dict, num_nodes_dict=None):
+    num_nodes_dict = maybe_num_nodes_dict(edge_index_dict, num_nodes_dict)
+
+    tmp = list(edge_index_dict.values())[0]
+
+    key2int = {}
+
+    cumsum, offset = 0, {}  # Helper data.
+    node_types, local_node_indices = [], []
+    local2global = {}
+    for i, (key, N) in enumerate(num_nodes_dict.items()):
+        key2int[key] = i
+        node_types.append(tmp.new_full((N, ), i))
+        local_node_indices.append(torch.arange(N, device=tmp.device))
+        offset[key] = cumsum
+        local2global[key] = local_node_indices[-1] + cumsum
+        local2global[i] = local2global[key]
+        cumsum += N
+
+    node_type = torch.cat(node_types, dim=0)
+    local_node_idx = torch.cat(local_node_indices, dim=0)
+
+    edge_indices, edge_types = [], []
+    for i, (keys, edge_index) in enumerate(edge_index_dict.items()):
+        key2int[keys] = i
+        inc = torch.tensor([offset[keys[0]], offset[keys[-1]]]).view(2, 1)
+        edge_indices.append(edge_index + inc.to(tmp.device))
+        edge_types.append(tmp.new_full((edge_index.size(1), ), i))
+
+    edge_index = torch.cat(edge_indices, dim=-1)
+    edge_type = torch.cat(edge_types, dim=0)
+
+    return (edge_index, edge_type, node_type, local_node_idx, local2global,
+            key2int)
